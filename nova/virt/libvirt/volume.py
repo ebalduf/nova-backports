@@ -393,6 +393,11 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
     @utils.synchronized('connect_volume')
     def connect_volume(self, connection_info, disk_info):
         """Attach the volume to instance_name."""
+        def _normal_discover(iscsi_properties):
+            self._connect_to_iscsi_portal(iscsi_properties)
+            # Detect new/resized LUNs for existing sessions
+            self._run_iscsiadm(iscsi_properties, ("--rescan",))
+
         iscsi_properties = connection_info['data']
 
         # multipath installed, discovering other targets if available
@@ -400,39 +405,38 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
         # in order to fit storage vendor
         out = None
         if self.use_multipath:
-            out = self._run_iscsiadm_discover(iscsi_properties)
+            try:
+                out = self._run_iscsiadm_discover(iscsi_properties)
+                # There are two types of iSCSI multipath devices.  One which shares
+                # the same iqn between multiple portals, and the other which use
+                # different iqns on different portals.  Try to identify the type by
+                # checking the iscsiadm output if the iqn is used by multiple
+                # portals.  If it is, it's the former, so use the supplied iqn.
+                # Otherwise, it's the latter, so try the ip,iqn combinations to
+                # find the targets which constitutes the multipath device.
+                ips_iqns = self._get_target_portals_from_iscsiadm_output(out)
+                same_portal = False
+                all_portals = set()
+                match_portals = set()
+                for ip, iqn in ips_iqns:
+                    all_portals.add(ip)
+                    if iqn == iscsi_properties['target_iqn']:
+                        match_portals.add(ip)
+                if len(all_portals) == len(match_portals):
+                    same_portal = True
 
-            # There are two types of iSCSI multipath devices.  One which shares
-            # the same iqn between multiple portals, and the other which use
-            # different iqns on different portals.  Try to identify the type by
-            # checking the iscsiadm output if the iqn is used by multiple
-            # portals.  If it is, it's the former, so use the supplied iqn.
-            # Otherwise, it's the latter, so try the ip,iqn combinations to
-            # find the targets which constitutes the multipath device.
-            ips_iqns = self._get_target_portals_from_iscsiadm_output(out)
-            same_portal = False
-            all_portals = set()
-            match_portals = set()
-            for ip, iqn in ips_iqns:
-                all_portals.add(ip)
-                if iqn == iscsi_properties['target_iqn']:
-                    match_portals.add(ip)
-            if len(all_portals) == len(match_portals):
-                same_portal = True
+                for ip, iqn in ips_iqns:
+                    props = iscsi_properties.copy()
+                    props['target_portal'] = ip.split(",")[0]
+                    if not same_portal:
+                        props['target_iqn'] = iqn
+                    self._connect_to_iscsi_portal(props)
 
-            for ip, iqn in ips_iqns:
-                props = iscsi_properties.copy()
-                props['target_portal'] = ip.split(",")[0]
-                if not same_portal:
-                    props['target_iqn'] = iqn
-                self._connect_to_iscsi_portal(props)
-
-            self._rescan_iscsi()
+                self._rescan_iscsi()
+            except processutils.ProcessExecutionError:
+                _normal_discover(iscsi_properties)
         else:
-            self._connect_to_iscsi_portal(iscsi_properties)
-
-            # Detect new/resized LUNs for existing sessions
-            self._run_iscsiadm(iscsi_properties, ("--rescan",))
+            _normal_discover(iscsi_properties)
 
         host_device = self._get_host_device(iscsi_properties)
 
@@ -556,8 +560,11 @@ class LibvirtISCSIVolumeDriver(LibvirtBaseVolumeDriver):
               self).disconnect_volume(connection_info, disk_dev)
 
         if self.use_multipath and multipath_device:
-            return self._disconnect_volume_multipath_iscsi(iscsi_properties,
+            try:
+                return self._disconnect_volume_multipath_iscsi(iscsi_properties,
                                                            multipath_device)
+            except processutils.ProcessExecutionError:
+                pass
 
         # NOTE(vish): Only disconnect from the target if no luns from the
         #             target are in use.
